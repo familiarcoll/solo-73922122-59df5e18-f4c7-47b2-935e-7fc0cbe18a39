@@ -13,7 +13,15 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .accents import AccentPolicy
-from .archive import delete_page, get_page, search, upsert_page
+from .archive import (
+    PageNotFoundError,
+    StaleRevisionError,
+    delete_page,
+    get_page,
+    purge_page,
+    search,
+    upsert_page,
+)
 from .config import SETTINGS
 from .db import claim_rebuild, connect, fail_job, get_job, get_status, init_db
 from .rebuild import cancel_local_rebuilds, start_rebuild_thread
@@ -49,6 +57,25 @@ page corrections and an online, background index rebuild.
 * A failed or interrupted rebuild leaves the previous generation active. The
   committed pages and change log are durable, so a restart can rebuild again.
 
+### Permanent purge of a mistakenly ingested page
+
+* `POST /api/pages/{page_id}/purge` with the revision you last observed
+  removes the mistaken OCR page for good in a single transaction.
+* It deletes the canonical page row, clears the title/body from the page's
+  earlier change-log rows (sequence numbers and other metadata are kept), and
+  deletes the text from every index generation, including an index being
+  rebuilt in the background. Only SQLite logical records are affected; no
+  disk-level forensic erasure is attempted.
+* A rebuild that already snapshotted the old page cannot write its text back:
+  the purge appends a durable `purge` log entry that catch-up replays as a
+  delete, and the scrubbed historical rows are replayed as no-ops. Other pages
+  keep being indexed, corrected and searched while the purge runs.
+* If the page changed after you read the revision, the API answers **409**
+  without changing anything. Re-sending the original purge request returns the
+  original result (`"replayed": true`) and never deletes a page later recreated
+  with the same ID. Re-writing the same ID is allowed; the new revision is
+  always larger because revisions are durable change-log sequence numbers.
+
 ### Two-minute Swagger demo
 
 Use the **Try it out** controls below (or `curl`):
@@ -71,6 +98,12 @@ Use the **Try it out** controls below (or `curl`):
 6. **After success** — `GET /api/search?q=cafe` now finds `café`-spelled text,
    deleted pages stay deleted, and returned titles/bodies are the corrected
    committed versions.
+7. **Permanently purge a mistaken page** — note the `revision` from
+   `GET /api/pages/ocr-001`, then `POST /api/pages/ocr-001/purge` with
+   `{"revision": <that revision>}`. Afterwards the page, its search hits and the
+   text in every old change-log row are gone; the same request again returns
+   the stored result, and a stale revision returns 409. Re-`PUT` the same ID to
+   demonstrate that the new revision is larger.
 
 For a visible on-screen demonstration with a tiny dataset, run the API with
 `REBUILD_BATCH_DELAY_MS=250` (or increase the page count). The delay is only a
@@ -118,6 +151,29 @@ class PageUpsert(BaseModel):
 
     title: str = Field(default="", description="OCR page title (UTF-8, accents preserved)")
     body: str = Field(default="", description="OCR page body (UTF-8, accents preserved)")
+
+
+class PurgeRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "summary": "Permanently purge the page at its current revision",
+                    "value": {"revision": 7},
+                },
+            ]
+        },
+    )
+
+    revision: int = Field(
+        ge=1,
+        description=(
+            "The revision currently observed via GET/PUT, i.e. the `revision` "
+            "field of the live page. If the page changed in the meantime and the "
+            "revision no longer matches, the request fails with HTTP 409."
+        ),
+    )
 
 
 class RebuildRequest(BaseModel):
@@ -286,6 +342,89 @@ def remove_page(
         return delete_page(page_id)
     except Exception:
         logger.exception("page delete failed for %s", page_id)
+        raise
+
+
+@app.post(
+    "/api/pages/{page_id}/purge",
+    tags=["pages"],
+    summary="Permanently purge an OCR page and every stored copy of its text",
+    response_description=(
+        "One atomic result covering the page row, the scrubbed change log and "
+        "every FTS generation. Replaying the same request returns the stored "
+        "result without deleting a page later recreated with the same ID."
+    ),
+    responses={
+        404: {"description": "No live page and no prior purge ledger entry for this page ID / revision."},
+        409: {
+            "description": (
+                "Revision conflict: the supplied revision does not match the "
+                "page's current revision. Nothing was changed."
+            )
+        },
+    },
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "purge_at_seen_revision": {
+                            "summary": "Purge the page at the revision currently observed",
+                            "value": {"revision": 7},
+                        },
+                    }
+                }
+            }
+        }
+    },
+)
+def purge_page_endpoint(
+    page_id: Annotated[
+        str,
+        Path(
+            min_length=1,
+            max_length=512,
+            description="Page ID to purge, e.g. `ocr-001`.",
+            examples=["ocr-001", "scan-berlin-042"],
+        ),
+    ],
+    payload: Annotated[
+        PurgeRequest,
+        Body(
+            description=(
+                "The revision previously returned for this page. The purge only "
+                "proceeds when the live page still has that revision."
+            )
+        ),
+    ],
+) -> dict:
+    try:
+        return purge_page(page_id, payload.revision)
+    except StaleRevisionError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "revision_conflict",
+                "page_id": exc.page_id,
+                "expected_revision": exc.expected_revision,
+                "current_revision": exc.current_revision,
+                "message": (
+                    "the page changed after this revision was observed; re-read "
+                    "the page and decide whether the newer revision should be purged"
+                ),
+            },
+        ) from exc
+    except PageNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "page_not_found",
+                "page_id": exc.page_id,
+                "message": "no live page and no recorded purge for this page ID and revision",
+            },
+        ) from exc
+    except Exception:
+        logger.exception("page purge failed for %s", page_id)
         raise
 
 

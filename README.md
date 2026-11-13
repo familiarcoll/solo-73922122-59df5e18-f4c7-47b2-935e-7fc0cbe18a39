@@ -133,6 +133,54 @@ curl --get "$BASE/api/search" --data-urlencode 'q=resume'
 Deleted `ocr-002` remains absent, and returned titles/bodies are the corrected
 committed versions from the same SQLite snapshot as the hit.
 
+### 7. Permanently purge a mistakenly ingested page
+
+When an OCR page was ingested by mistake and its historical text must not
+remain anywhere in the archive, purge it by page ID and the revision you last
+observed:
+
+```bash
+# Note the current revision first.
+curl -sS "$BASE/api/pages/ocr-001"
+# then purge that exact revision.
+curl -sS -X POST "$BASE/api/pages/ocr-001/purge" \
+  -H 'Content-Type: application/json' \
+  -d '{"revision": 3}'
+```
+
+The purge is one atomic SQLite transaction and covers every logical copy of
+the text:
+
+* the canonical `pages` row is deleted, so `GET /api/pages/ocr-001` returns
+  404 and later searches can never return it;
+* the title/body columns are cleared in every earlier `changes` row for the
+  page, while the sequence numbers, op kinds, revisions and timestamps are
+  retained;
+* the page is removed from **every** FTS generation, including a generation a
+  background rebuild is still constructing;
+* a durable `purge` entry is appended to the change log so a rebuild that
+  already snapshotted the old page replays a delete instead of writing the old
+  text back. Scrubbed historical rows are replayed as no-ops.
+
+Only SQLite logical records are removed; the service does not attempt
+disk-level forensic erasure.
+
+**Revision conflict (409).** If the page changed after the client read its
+revision, `POST .../purge` answers HTTP `409` and changes nothing. The body
+reports both the supplied and the current revision.
+
+**Idempotent replay.** Re-sending the identical purge request returns the
+original stored result with `"replayed": true`. If the same page ID was
+recreated in the meantime, that newer page is not deleted. Writing the same ID
+again is always allowed; revisions are durable change-log sequence numbers and
+therefore strictly increase, even across purges and restarts.
+
+**Durability.** The purge commits to the WAL database file, so after a restart
+the page and its text stay gone and the replay ledger still works.
+
+The purge never blocks other work: background rebuilds keep processing other
+pages, and other pages remain correctable and searchable while it runs.
+
 ## Accent examples
 
 | Document word | `keep` query | `fold` query |
@@ -154,6 +202,7 @@ non-Latin combining marks are preserved.
 |---|---|---|
 | `PUT` | `/api/pages/{page_id}` | Insert/replace an OCR title and body. |
 | `DELETE` | `/api/pages/{page_id}` | Idempotent delete. |
+| `POST` | `/api/pages/{page_id}/purge` | Permanent purge by page ID and observed revision (409 on conflict, idempotent replay). |
 | `GET` | `/api/pages/{page_id}` | Read a committed page. |
 | `GET` | `/api/search?q=word` | Word search over the active FTS generation. |
 | `POST` | `/api/index/rebuild` | Queue/switch accent policy through a background rebuild. |
@@ -202,6 +251,15 @@ schema.
 * **Fencing** — the final activation re-checks the job's claim token and
   active state under the write lock, so a stale worker that resumes cannot
   switch an obsolete generation after a newer job has been claimed.
+* **Permanent purge** — a purge runs in a single `BEGIN IMMEDIATE`
+  transaction shared by both API worker processes, so the page deletion, the
+  change-log scrub, the removal from every FTS generation and the idempotency
+  ledger insert commit or roll back together. The `purges` ledger is keyed by
+  `(page_id, expected_revision)`: a replay returns the stored result and can
+  never delete a page recreated with the same ID at a larger revision. A
+  revision mismatch fails with 409 before any write. Rebuild workers treat a
+  `purge` log row as a delete and a text-less historical row as a no-op, so an
+  already-read snapshot cannot resurrect scrubbed text.
 
 FTS rowids are taken from the canonical page rowid and every log entry carries
 that rowid, making updates/deletes O(index lookup) rather than rescanning the
@@ -235,4 +293,8 @@ pytest -q
 
 The tests exercise exact vs folded search, a rebuild that finishes with a
 correction and a deletion submitted during the scan, duplicate job idempotency,
-and restart/stale-job recovery. They use temporary SQLite files.
+restart/stale-job recovery, and the permanent purge API: 409 revision
+conflicts, idempotent replay that spares a recreated same-ID page, scrubbed
+change logs, removal from every FTS generation (including one being rebuilt),
+restart durability, concurrent purges and the legacy-schema migration. They
+use temporary SQLite files.

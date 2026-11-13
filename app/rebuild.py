@@ -328,7 +328,16 @@ def _apply_change_rows(
     for row in rows:
         page_id = row["page_id"]
         page_ref = int(row["page_ref"]) if row["page_ref"] is not None else None
-        if row["op"] == "upsert":
+        if row["op"] == "purge":
+            # A permanent purge removed the page and scrubbed every earlier
+            # text-bearing log row for it.  Replay the deletion so a snapshot
+            # that had already read the old text cannot write it back.
+            _delete_document(conn, table, page_ref, page_id)
+        elif row["op"] == "upsert" and row["title"] is None and row["body"] is None:
+            # Historical text was scrubbed by a later purge; there is nothing
+            # left to index for this version of the page.
+            pass
+        elif row["op"] == "upsert":
             _replace_document(
                 conn,
                 table,

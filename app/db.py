@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS changes (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     page_id TEXT NOT NULL,
     page_ref INTEGER,
-    op TEXT NOT NULL CHECK (op IN ('upsert', 'delete')),
+    op TEXT NOT NULL CHECK (op IN ('upsert', 'delete', 'purge')),
     title TEXT,
     body TEXT,
     rev INTEGER NOT NULL,
@@ -43,6 +43,20 @@ CREATE TABLE IF NOT EXISTS changes (
 );
 
 CREATE INDEX IF NOT EXISTS ix_changes_seq ON changes(seq);
+
+-- Idempotency ledger for permanent purges.  A purge is identified by the
+-- (page_id, revision) pair the client originally saw.  Replaying the same
+-- purge request returns the stored result instead of touching any page that
+-- was later recreated with the same ID.
+CREATE TABLE IF NOT EXISTS purges (
+    page_id TEXT NOT NULL,
+    expected_rev INTEGER NOT NULL,
+    purge_seq INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    result_json TEXT NOT NULL,
+    purged_at TEXT NOT NULL,
+    PRIMARY KEY (page_id, expected_rev)
+);
 
 CREATE TABLE IF NOT EXISTS generations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -210,6 +224,40 @@ def init_db() -> None:
         }
         if "owner_proc_start" not in job_columns:
             conn.execute("ALTER TABLE rebuild_jobs ADD COLUMN owner_proc_start TEXT")
+
+        # Databases created before permanent purges existed restrict changes.op
+        # to ('upsert', 'delete').  Rebuild the table so the 'purge' op is
+        # accepted.  The AUTOINCREMENT sequence table keeps issuing strictly
+        # larger seqs after the rebuild, preserving revision monotonicity.
+        changes_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'changes'"
+        ).fetchone()
+        if changes_sql is not None and "'purge'" not in str(changes_sql[0]):
+            conn.execute(
+                """
+                CREATE TABLE changes_new (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    page_id TEXT NOT NULL,
+                    page_ref INTEGER,
+                    op TEXT NOT NULL CHECK (op IN ('upsert', 'delete', 'purge')),
+                    title TEXT,
+                    body TEXT,
+                    rev INTEGER NOT NULL,
+                    changed_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO changes_new
+                    (seq, page_id, page_ref, op, title, body, rev, changed_at)
+                SELECT seq, page_id, page_ref, op, title, body, rev, changed_at
+                  FROM changes
+                """
+            )
+            conn.execute("DROP TABLE changes")
+            conn.execute("ALTER TABLE changes_new RENAME TO changes")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_changes_seq ON changes(seq)")
 
         active_setting = conn.execute(
             "SELECT value FROM settings WHERE key = 'active_generation_id'"
